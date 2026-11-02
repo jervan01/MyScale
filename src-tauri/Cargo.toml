@@ -1,0 +1,25 @@
+[package]
+name = "myscale"
+version = "0.1.0"
+description = "MyScale - Headscale / Tailscale compatible control-plane client"
+edition = "2021"
+
+[lib]
+# the lib name must differ from the package name so Windows builds don't clash
+name = "myscale_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# "dangerous-settings" enables the per-request option to accept self-signed certificates (used only when the user ticks it)
+tauri-plugin-http = { version = "2", features = ["dangerous-settings"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
