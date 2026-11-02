@@ -1,0 +1,290 @@
+name: Build MyScale APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "目标架构 (大多数手机选 aarch64)"
+        type: choice
+        options:
+          - aarch64
+          - armv7
+          - x86_64
+          - all
+        default: aarch64
+  push:
+    tags:
+      - "v*"
+
+# 推送 v* 标签时需要写权限才能创建 Release，否则会 403
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: MyScale
+  KEY_ALIAS: myscale
+  NDK_VERSION: "26.1.10909125"
+  # 设置了 Secrets 就用你自己的签名密钥，否则自动生成并缓存
+  HAS_KEYSTORE_SECRET: ${{ secrets.ANDROID_KEYSTORE_B64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sanity check project files
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in app-icon.png src/index.html src/app.js src/core.js src/style.css \
+                   src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/build.rs \
+                   src-tauri/src/lib.rs src-tauri/src/main.rs src-tauri/capabilities/default.json; do
+            if [ ! -f "$f" ]; then echo "::error::缺少文件: $f"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Run pure-logic tests (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: node --test tests/core.test.js
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 不使用 android-actions/setup-android；直接用 runner 自带的 sdkmanager
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?ANDROID_HOME is not set on this runner}"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          [ -n "$SDKMANAGER" ] && [ -x "$SDKMANAGER" ] || { echo "::error::找不到 sdkmanager (ANDROID_HOME=$ANDROID_HOME)"; exit 1; }
+          echo "Using $SDKMANAGER"
+          # `yes` 会因 SIGPIPE 返回非 0，这里不让它终止脚本
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses > /dev/null || true
+          set -o pipefail
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "ndk;${NDK_VERSION}"
+          NDK="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          [ -d "$NDK" ] || { echo "::error::NDK 未安装成功: $NDK"; exit 1; }
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Install Rust (stable) with Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      # 必须用 cargo 安装 CLI：Gradle 打包阶段会回调 `cargo tauri ...`，npm 版会报 Cannot find module
+      - name: Install Tauri CLI via cargo
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v cargo-tauri >/dev/null 2>&1; then
+            echo "cargo-tauri already installed"
+          else
+            cargo install tauri-cli --version "^2" --locked
+          fi
+          cargo tauri --version
+
+      - name: Use tag as app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            python3 - "$VER" <<'PY'
+          import json, sys
+          p = "src-tauri/tauri.conf.json"
+          d = json.load(open(p, encoding="utf-8"))
+          d["version"] = sys.argv[1]
+          json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          print("tauri.conf.json version ->", sys.argv[1])
+          PY
+          else
+            echo "Tag '$GITHUB_REF_NAME' is not vX.Y.Z; keeping version from tauri.conf.json"
+          fi
+
+      - name: Generate icons
+        run: cargo tauri icon app-icon.png
+
+      - name: Init Android project
+        run: cargo tauri android init --ci
+
+      # 可选：把启动窗口/系统栏背景设成深色，避免启动时白闪
+      - name: Dark window background (optional)
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob, re
+          files = glob.glob("src-tauri/gen/android/app/src/main/res/values*/themes.xml")
+          if not files:
+              print("themes.xml not found, skipping")
+          for p in files:
+              s = open(p, encoding="utf-8").read()
+              if "myscale-dark" in s:
+                  continue
+              add = ('    <!-- myscale-dark -->\n'
+                     '    <item name="android:windowBackground">#FF0B0D14</item>\n'
+                     '    <item name="android:statusBarColor">#FF0B0D14</item>\n'
+                     '    <item name="android:navigationBarColor">#FF0B0D14</item>\n')
+              s2 = re.sub(r"(</style>)", add + r"\1", s, count=1)
+              open(p, "w", encoding="utf-8").write(s2)
+              print("patched", p)
+          PY
+
+      # 保险：若生成的工程需要比 34/35 更高的 compileSdk，则补装对应平台
+      - name: Ensure compileSdk platform is installed
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          GRADLE="src-tauri/gen/android/app/build.gradle.kts"
+          [ -f "$GRADLE" ] || exit 0
+          SDKS=$(grep -Eo '(compileSdk|targetSdk)\s*=\s*[0-9]+' "$GRADLE" | grep -Eo '[0-9]+$' | sort -u)
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          for n in $SDKS; do
+            if [ ! -d "$ANDROID_HOME/platforms/android-$n" ]; then
+              echo "Installing platforms;android-$n"
+              "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "platforms;android-$n" || true
+            fi
+          done
+
+      - name: Resolve target architectures
+        id: arch
+        shell: bash
+        env:
+          INPUT_ARCH: ${{ github.event.inputs.arch }}
+        run: |
+          set -euo pipefail
+          A="${INPUT_ARCH:-aarch64}"
+          case "$A" in
+            aarch64|armv7|x86_64) ARGS="--target $A" ;;
+            all)                  ARGS="--target aarch64 --target armv7 --target x86_64" ;;
+            *) echo "::error::未知架构: $A"; exit 1 ;;
+          esac
+          echo "arch=$A" >> "$GITHUB_OUTPUT"
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "Building for: $A ($ARGS)"
+
+      - name: Build APK
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo tauri android build --apk --ci ${{ steps.arch.outputs.args }}
+
+      # ---------- 签名 ----------
+      - name: Restore generated keystore cache
+        if: env.HAS_KEYSTORE_SECRET != 'true'
+        id: ks-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.myscale-keystore
+          key: myscale-keystore-v1
+
+      - name: Prepare keystore
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_SECRET_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_KEYSTORE_SECRET" = "true" ]; then
+            KS_PATH="$RUNNER_TEMP/release.keystore"
+            printf '%s' "$KS_B64" | base64 -d > "$KS_PATH"
+            KS_PASS="$KS_SECRET_PASS"
+            SRC="Secrets"
+          else
+            mkdir -p "$HOME/.myscale-keystore"
+            KS_PATH="$HOME/.myscale-keystore/myscale.keystore"
+            KS_PASS="myscale-auto-key"
+            if [ ! -f "$KS_PATH" ]; then
+              keytool -genkeypair -v -keystore "$KS_PATH" -alias "$KEY_ALIAS" \
+                -keyalg RSA -keysize 2048 -validity 36500 \
+                -storepass "$KS_PASS" -keypass "$KS_PASS" \
+                -dname "CN=MyScale, OU=CI, O=MyScale, C=US"
+              SRC="新生成（已写入缓存）"
+            else
+              SRC="缓存"
+            fi
+          fi
+          echo "::add-mask::$KS_PASS"
+          echo "KS_PATH=$KS_PATH" >> "$GITHUB_ENV"
+          echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+          echo "KS_SOURCE=$SRC" >> "$GITHUB_ENV"
+
+      - name: Align and sign APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          mkdir -p dist
+          mapfile -t FILES < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -path '*release*' | sort)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::没有找到 release APK（检查上一步 Build APK 的日志）"
+            find src-tauri/gen/android/app/build/outputs -type f | head -50 || true
+            exit 1
+          fi
+          for f in "${FILES[@]}"; do
+            if [ "${#FILES[@]}" -eq 1 ]; then OUT="${APP_NAME}.apk"; else OUT="${APP_NAME}-$(basename "$(dirname "$(dirname "$f")")").apk"; fi
+            ALIGNED="$RUNNER_TEMP/aligned-$OUT"
+            rm -f "$ALIGNED" "dist/$OUT"
+            "$BT/zipalign" -f -p 4 "$f" "$ALIGNED"
+            "$BT/apksigner" sign --ks "$KS_PATH" --ks-pass env:KS_PASS \
+              --ks-key-alias "$KEY_ALIAS" --key-pass env:KS_PASS \
+              --out "dist/$OUT" "$ALIGNED"
+            "$BT/apksigner" verify --verbose --print-certs "dist/$OUT" | head -12
+          done
+          ls -la dist
+          {
+            echo "### MyScale APK"
+            echo "- 架构: \`${{ steps.arch.outputs.arch }}\`"
+            echo "- 签名密钥来源: ${KS_SOURCE}"
+            if [ "$HAS_KEYSTORE_SECRET" != "true" ]; then
+              echo "- ⚠️ 使用的是自动生成的密钥。缓存若被清除，下次签名会变，需卸载旧版后才能安装新版。要长期稳定，请设置 Secrets（见 README）。"
+            fi
+            echo ""
+            echo "| 文件 | 大小 |"
+            echo "|---|---|"
+            for a in dist/*.apk; do echo "| $(basename "$a") | $(du -h "$a" | cut -f1) |"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-apk-${{ steps.arch.outputs.arch }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
