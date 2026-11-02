@@ -1,0 +1,22 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "MyScale: core + HTTP client. Users enter their own Headscale address at runtime, so every http/https host (and any port) is allowed. To lock it down, replace these entries with your own domain, e.g. { \"url\": \"https://hs.example.com\" }.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://*" },
+        { "url": "https://*:*" },
+        { "url": "https://*/*" },
+        { "url": "https://*:*/*" },
+        { "url": "http://*" },
+        { "url": "http://*:*" },
+        { "url": "http://*/*" },
+        { "url": "http://*:*/*" }
+      ]
+    }
+  ]
+}
