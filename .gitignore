@@ -1,0 +1,16 @@
+# Rust / Tauri build output (regenerated in CI)
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/icons/
+
+# signing material - NEVER commit
+*.keystore
+*.jks
+*.p12
+
+# misc
+dist/
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
